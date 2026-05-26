@@ -32,6 +32,9 @@ import {
   UserModelOverrides,
   CustomModel,
   DEFAULT_REQUEST_LOG_CONFIG,
+  createDefaultModelMappings,
+  normalizeModelMappingsWithDefaults,
+  sanitizeDeepSeekModelOverrides,
 } from './types'
 import { BUILTIN_PROMPTS } from '../data/builtin-prompts'
 import { RequestLogManager } from '../requestLogs/manager'
@@ -105,6 +108,7 @@ class StoreManager {
 
       await this.initializeAppLogManager(storagePath)
       await this.initializeRequestLogManager(storagePath)
+      this.initializeDefaultModelMappings()
       await this.initializeDefaultProviders()
       this.isInitialized = true
       this.initializationError = null
@@ -123,6 +127,7 @@ class StoreManager {
         })
         await this.initializeAppLogManager(storagePath)
         await this.initializeRequestLogManager(storagePath)
+        this.initializeDefaultModelMappings()
         this.isInitialized = true
         this.initializationError = null
         console.log('[Store] Successfully recovered from corrupted data')
@@ -244,12 +249,31 @@ class StoreManager {
 
     return {
       ...rawConfig,
+      modelMappings: normalizeModelMappingsWithDefaults(rawConfig.modelMappings),
+      defaultModelMappingsSeeded: config.defaultModelMappingsSeeded,
       requestLogConfig: normalizeRequestLogConfig(
         rawConfig.requestLogConfig || DEFAULT_REQUEST_LOG_CONFIG,
       ),
       toolCallingConfig: normalizeToolCallingConfig(rawToolCallingConfig),
       toolPromptConfig: undefined,
     }
+  }
+
+  private initializeDefaultModelMappings(): void {
+    const rawConfig = this.store?.get('config') || DEFAULT_CONFIG
+    const config = this.normalizeConfig(rawConfig)
+    if (config.defaultModelMappingsSeeded) {
+      this.store?.set('config', config)
+      return
+    }
+    this.store?.set('config', this.normalizeConfig({
+      ...config,
+      modelMappings: {
+        ...createDefaultModelMappings(),
+        ...(config.modelMappings || {}),
+      },
+      defaultModelMappingsSeeded: true,
+    }))
   }
 
   /**
@@ -267,22 +291,34 @@ class StoreManager {
       return true
     })
     
-    const userModelOverrides = this.store?.get('userModelOverrides') || {}
+    const userModelOverrides: UserModelOverrides = {
+      ...(this.store?.get('userModelOverrides') || {}),
+    }
+    let userModelOverridesChanged = false
     
     const updatedProviders = validProviders.map((p: Provider) => {
       if (p.type === 'builtin') {
         const builtinConfig = BUILTIN_PROVIDERS.find(bp => bp.id === p.id)
         if (builtinConfig) {
-          const hasUserOverrides = userModelOverrides[p.id] && 
+          if (p.id === 'deepseek') {
+            const sanitizedOverrides = sanitizeDeepSeekModelOverrides(userModelOverrides[p.id])
+            if (JSON.stringify(sanitizedOverrides) !== JSON.stringify(userModelOverrides[p.id])) {
+              userModelOverrides[p.id] = sanitizedOverrides
+              userModelOverridesChanged = true
+            }
+          }
+
+          const hasUserOverrides = userModelOverrides[p.id] &&
             ((userModelOverrides[p.id].addedModels && userModelOverrides[p.id].addedModels.length > 0) ||
              (userModelOverrides[p.id].excludedModels && userModelOverrides[p.id].excludedModels.length > 0))
+          const shouldUseBuiltinModels = p.id === 'deepseek' || !hasUserOverrides
           
           return { 
             ...p, 
             apiEndpoint: builtinConfig.apiEndpoint,
             chatPath: builtinConfig.chatPath,
-            supportedModels: hasUserOverrides ? p.supportedModels : builtinConfig.supportedModels,
-            modelMappings: hasUserOverrides ? p.modelMappings : builtinConfig.modelMappings,
+            supportedModels: shouldUseBuiltinModels ? builtinConfig.supportedModels : p.supportedModels,
+            modelMappings: shouldUseBuiltinModels ? builtinConfig.modelMappings : p.modelMappings,
             headers: builtinConfig.headers,
             description: builtinConfig.description,
           }
@@ -291,6 +327,9 @@ class StoreManager {
       return p
     })
     
+    if (userModelOverridesChanged) {
+      this.store?.set('userModelOverrides', userModelOverrides)
+    }
     this.store?.set('providers', updatedProviders)
   }
 
